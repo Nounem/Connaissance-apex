@@ -102,6 +102,10 @@ Le débutant fait souvent cette erreur : il apprend la syntaxe, puis code comme 
 14. **Préférer `before trigger` quand on modifie le même enregistrement.**
 15. **Écrire du code lisible avant d’écrire du code “intelligent”.**
 
+## Pourquoi ces règles sont “absolues” et pas de simples préférences
+
+Ces règles ne sont pas des questions de style : les violer produit du code qui plante en production, pas seulement du code “moins élégant”. Un SOQL ou un DML dans une boucle (règles 1 et 2) fonctionne parfaitement en test avec 2 ou 3 enregistrements, puis lève une exception `System.LimitException` dès qu’un utilisateur importe 200 comptes via Data Loader ou qu’une intégration synchronise un lot de données — et c’est précisément à ce moment-là, en production, avec un client qui attend, que le code casse. Avoir plusieurs triggers sur le même objet (règle 4) crée un ordre d’exécution que Salesforce ne garantit pas de façon stable dans le temps : un trigger peut lire un enregistrement avant qu’un autre trigger ne l’ait modifié, ou après, selon un ordre qui dépend de l’historique de création des triggers — ce qui produit des bugs difficiles à reproduire et impossibles à expliquer sans connaître cet historique. Mettre la logique métier directement dans le trigger (règles 5 et 6) la rend impossible à réutiliser depuis un batch, un Queueable ou un contrôleur LWC, et impossible à tester sans passer par un véritable insert/update en base : la moindre évolution oblige alors à dupliquer le code plutôt qu’à l’appeler. Enfin, écrire du code lisible avant du code “intelligent” (règle 15) n’est pas une posture esthétique : dans six mois, ce sera peut-être toi — ou un collègue, un vendredi soir, sous pression — qui devra comprendre ce code pour corriger un bug urgent sans que tu sois là pour l’expliquer.
+
 ## Règles pour l’IA
 
 Quand une IA génère du code Apex, elle doit automatiquement vérifier :
@@ -336,6 +340,33 @@ List<Account> accounts = [
 ];
 ```
 
+## Attention à l’injection SOQL
+
+Dès qu’une requête est construite en concaténant une chaîne de caractères provenant d’un utilisateur (recherche, filtre dynamique, etc.), il existe un risque d’injection SOQL.
+
+Vulnérable :
+
+```apex
+String searchTerm = userInput; // vient par exemple d’un champ de recherche LWC
+String query = 'SELECT Id, Name FROM Account WHERE Name = \'' + searchTerm + '\'';
+List<Account> accounts = Database.query(query);
+```
+
+Un utilisateur malveillant peut injecter du SOQL via `searchTerm` pour modifier le comportement de la requête.
+
+Corrigé avec une bind variable :
+
+```apex
+String searchTerm = userInput;
+List<Account> accounts = [
+    SELECT Id, Name
+    FROM Account
+    WHERE Name = :searchTerm
+];
+```
+
+Si la requête doit rester dynamique (champs ou objet variables) et ne peut pas utiliser de bind variable classique, utilise `String.escapeSingleQuotes()` sur la valeur avant de l’insérer dans la chaîne, ou construis la requête avec des variables liées uniquement, jamais avec de la concaténation directe d’une valeur utilisateur.
+
 ## Règles SOQL
 
 - Sélectionne seulement les champs nécessaires.
@@ -434,7 +465,7 @@ for (Account acc : Trigger.new) {
 }
 ```
 
-Ce code consomme une requête et une opération DML par compte.
+Ce code consomme une requête et une opération DML par compte. Avec 200 comptes — une taille de lot courante avec Data Loader ou une API d’intégration — cela représente 200 requêtes SOQL et 200 DML dans la même transaction. Or un trigger est limité à 100 requêtes SOQL et 150 DML par transaction : ce code lève donc une `System.LimitException` dès le 101ᵉ compte, et Salesforce annule alors l’intégralité de la transaction, pas seulement le traitement des comptes en trop. Résultat concret : aucun des 200 comptes n’est traité, l’utilisateur voit une erreur au moment de son import, et si le trigger n’avait été testé qu’avec un ou deux comptes, ce bug n’apparaît jamais avant la mise en production.
 
 ## Bon réflexe
 
@@ -457,6 +488,8 @@ if (!accountsToUpdate.isEmpty()) {
     update accountsToUpdate;
 }
 ```
+
+Ce même traitement, quel que soit le nombre de comptes reçus par le trigger — 1, 200 ou 2 000 — ne consomme ici qu’une seule requête SOQL et une seule opération DML. C’est cette indépendance entre le nombre d’enregistrements traités et le nombre de requêtes/DML consommées qui rend le code valable en toutes circonstances, sans qu’il faille se demander “est-ce que ça tiendra si le volume augmente ?”.
 
 ## Outils utiles
 
@@ -570,7 +603,7 @@ trigger AccountTrigger on Account (before insert, before update) {
 }
 ```
 
-Avantage : pas besoin de faire `update Trigger.new`.
+Avantage : pas besoin de faire `update Trigger.new`. Ce n’est pas qu’un confort d’écriture : modifier un champ depuis un `after`, il faut faire un `update` explicite sur l’enregistrement, ce qui consomme une opération DML supplémentaire et redéclenche tous les triggers `before`/`after update` de l’objet — y compris potentiellement le trigger courant, avec un risque réel de boucle de récursion si aucune protection n’est en place. En `before`, la modification est simplement incluse dans la sauvegarde déjà en cours, sans DML supplémentaire ni relance des triggers.
 
 ## Quand utiliser after ?
 
@@ -598,6 +631,8 @@ Problèmes :
 - pas de handler ;
 - pas de gestion du bulk ;
 - risque de limite gouverneur.
+
+Concrètement, si ce trigger se déclenche sur une mise à jour groupée de 200 comptes (un import, une réaffectation de portefeuille, une synchronisation depuis un autre système), il exécute 200 requêtes SOQL et jusqu’à 200 DML l’un après l’autre dans la même transaction. Dès le 101ᵉ compte, Salesforce lève une exception de limite gouverneur et annule l’intégralité de la transaction — y compris les 100 premiers comptes qui, eux, auraient pu être traités sans problème. Ce type de code passe souvent inaperçu en développement, car un développeur qui teste en modifiant un seul compte dans l’interface ne déclenchera jamais l’erreur ; le bug n’apparaît qu’en production, au moment d’un traitement en masse, ce qui le rend particulièrement difficile à anticiper avant la mise en prod.
 
 ---
 
@@ -756,6 +791,10 @@ public with sharing class OpportunityService {
 }
 ```
 
+## Pourquoi cette version est meilleure ?
+
+Le mauvais exemple met la décision métier (“une opportunité gagnée doit générer une tâche d’onboarding”) directement dans le trigger. Si, plus tard, il faut recréer les tâches manquantes pour des opportunités déjà closes via un batch de rattrapage, ou exposer cette même règle à un bouton ou une API, il faudra soit dupliquer cette logique, soit passer par un vrai update d’opportunité juste pour redéclencher le trigger — ce qui est fragile et coûteux en limites. La version service isole cette règle dans une méthode que le trigger, un batch, un contrôleur LWC ou une classe de test peuvent appeler directement avec des listes en mémoire, sans dépendre du contexte trigger ni d’un DML réel.
+
 ---
 
 # 14. Selector / Repository Layer
@@ -865,13 +904,27 @@ public with sharing class AccountService {
 }
 ```
 
-Utilise généralement `with sharing` pour les services exposés à l’utilisateur.
+Utilise généralement `with sharing` pour les services exposés à l’utilisateur. Une classe déclarée sans mention explicite (`public class AccountService`) s’exécute par défaut sans application des règles de partage, ce qui revient en pratique à `without sharing` : elle ignore les visibilités et peut retourner ou modifier des enregistrements auxquels l’utilisateur connecté n’a normalement pas accès. Concrètement, un commercial qui ne devrait voir que les comptes de son secteur pourrait, via une méthode Apex mal déclarée et exposée à un composant LWC, consulter ou modifier des comptes appartenant à d’autres commerciaux — une fuite de données silencieuse, d’autant plus difficile à détecter que les tests unitaires s’exécutent eux aussi avec les droits complets par défaut, sauf si on précise explicitement un utilisateur de test restreint.
+
+## `inherited sharing`
+
+Il existe aussi le mot-clé `inherited sharing`. Une classe déclarée ainsi hérite du contexte de partage de la classe qui l’appelle : `with sharing` si elle est appelée depuis une classe `with sharing`, `without sharing` si elle est appelée depuis une classe `without sharing`, et `with sharing` par défaut si elle est le point d’entrée (par exemple appelée depuis un contrôleur LWC).
+
+```apex
+public inherited sharing class AccountUtils {
+    // Hérite du contexte d’exécution de l’appelant
+}
+```
+
+C’est particulièrement utile pour une classe utilitaire ou un selector réutilisé un peu partout : elle reste sécurisée par défaut, sans forcer artificiellement `with sharing` dans des contextes où l’appelant a légitimement besoin de `without sharing`.
 
 ## CRUD et FLS
 
 CRUD signifie : l’utilisateur a-t-il le droit de créer, lire, modifier ou supprimer un objet ?
 
 FLS signifie : l’utilisateur a-t-il accès à un champ ?
+
+Sans vérification CRUD/FLS, une requête ou un DML Apex s’exécute avec les droits du contexte d’exécution (souvent complets, surtout en `without sharing` ou dans un contexte système), même si le profil de l’utilisateur connecté lui interdit explicitement de voir ou modifier ce champ. Exemple concret : un champ `Salary__c` masqué pour la plupart des profils dans la configuration de sécurité peut malgré tout être lu ou écrit via une méthode Apex `@AuraEnabled` exposée à un composant LWC, si cette méthode ne vérifie pas la FLS avant d’accéder au champ — ce qui contourne complètement le travail de configuration fait par les administrateurs et expose une donnée sensible à des utilisateurs qui ne devraient pas y avoir accès.
 
 ## Exemple de vérification simple
 
@@ -907,6 +960,29 @@ List<SObject> safeRecords = decision.getRecords();
 update safeRecords;
 ```
 
+## `WITH USER_MODE` (approche recommandée pour le nouveau code)
+
+Depuis l’API 56, `WITH USER_MODE` est l’approche à privilégier pour les nouvelles requêtes SOQL : elle applique CRUD et FLS selon les droits de l’utilisateur courant, comme `WITH SECURITY_ENFORCED`, mais sans ses limites connues (par exemple les erreurs levées sur certaines sous-requêtes ou certains agrégats).
+
+Important : `WITH SECURITY_ENFORCED` n’est plus seulement déconseillée, elle a été **retirée par Salesforce à partir de l’API 67.0 (Winter ’26)** — une classe compilée avec cette version d’API (ou une version ultérieure) ne compile plus si elle contient cette clause. Migrer vers `WITH USER_MODE` est donc désormais une obligation, pas seulement une recommandation, dès que le code cible l’API 67 ou plus.
+
+```apex
+List<Account> accounts = [
+    SELECT Id, Name
+    FROM Account
+    WITH USER_MODE
+];
+```
+
+`AccessLevel.USER_MODE` peut aussi être utilisé sur les opérations DML pour appliquer les mêmes vérifications :
+
+```apex
+Database.insert(accountsToInsert, AccessLevel.USER_MODE);
+Database.update(accountsToUpdate, AccessLevel.USER_MODE);
+```
+
+Pour du code déjà existant utilisant `WITH SECURITY_ENFORCED`, il n’est pas urgent de tout réécrire, mais privilégie `WITH USER_MODE` pour tout nouveau développement.
+
 ## Règle IA
 
 Quand une IA génère du code Apex exposé à un utilisateur, elle doit préciser comment la sécurité est gérée.
@@ -925,6 +1001,8 @@ try {
 } catch (Exception e) {
 }
 ```
+
+Ce `catch` vide ne provoque aucune erreur visible, mais `update accounts` peut très bien avoir échoué silencieusement (un champ obligatoire manquant, une règle de validation déclenchée, un problème de FLS) : les données ne sont jamais mises à jour, personne n’en est informé, et le bug ne sera découvert que des semaines plus tard, quand un utilisateur remarquera que ses enregistrements ne se sont jamais synchronisés — sans aucun log pour comprendre pourquoi ni depuis quand.
 
 Bon :
 
@@ -965,6 +1043,24 @@ for (Integer i = 0; i < results.size(); i++) {
     }
 }
 ```
+
+## Savepoint et rollback
+
+Quand une transaction enchaîne plusieurs DML qui doivent réussir ou échouer ensemble (par exemple insérer un compte puis des contacts liés), un `Savepoint` permet d’annuler proprement tout ce qui a été fait depuis ce point si une étape échoue.
+
+```apex
+Savepoint sp = Database.setSavepoint();
+
+try {
+    insert account;
+    insert contacts;
+} catch (DmlException e) {
+    Database.rollback(sp);
+    throw new ApplicationException('Échec de la création du compte et de ses contacts : ' + e.getMessage());
+}
+```
+
+À utiliser avec modération : chaque `Savepoint` a un coût en limites gouverneur, et ce n’est utile que lorsque plusieurs opérations DML distinctes doivent être annulées ensemble (une seule opération DML est déjà atomique par elle-même).
 
 ---
 
@@ -1055,6 +1151,52 @@ Lancement :
 Database.executeBatch(new AccountBatch(), 200);
 ```
 
+### Options utiles pour un batch
+
+- `Database.Stateful` : implémente cette interface en plus de `Database.Batchable` quand tu as besoin de conserver l’état (compteurs, listes d’erreurs) entre chaque exécution de `execute()`. Sans elle, chaque lot repart avec des variables d’instance réinitialisées.
+
+```apex
+public with sharing class AccountBatch implements Database.Batchable<SObject>, Database.Stateful {
+    private Integer processedCount = 0;
+
+    public void execute(Database.BatchableContext bc, List<Account> scope) {
+        processedCount += scope.size();
+        update scope;
+    }
+
+    public void finish(Database.BatchableContext bc) {
+        System.debug(LoggingLevel.INFO, 'Total traité : ' + processedCount);
+    }
+}
+```
+
+- `Database.AllowsCallouts` : implémente cette interface en plus si le batch doit faire des callouts HTTP dans `execute()`.
+
+```apex
+public with sharing class AccountSyncBatch implements Database.Batchable<SObject>, Database.AllowsCallouts {
+    // ...
+}
+```
+
+- Gestion des erreurs par lot : utilise `Database.update(scope, false)` (ou `Database.insert`) dans `execute()` plutôt qu’un DML direct, pour qu’un enregistrement en échec ne fasse pas échouer tout le lot, et logge les erreurs individuellement.
+
+```apex
+public void execute(Database.BatchableContext bc, List<Account> scope) {
+    for (Account acc : scope) {
+        acc.Description = 'Processed by batch';
+    }
+
+    Database.SaveResult[] results = Database.update(scope, false);
+    for (Database.SaveResult result : results) {
+        if (!result.isSuccess()) {
+            for (Database.Error err : result.getErrors()) {
+                System.debug(LoggingLevel.ERROR, 'Erreur batch: ' + err.getMessage());
+            }
+        }
+    }
+}
+```
+
 ## Scheduled Apex
 
 ```apex
@@ -1072,6 +1214,8 @@ public with sharing class AccountScheduler implements Schedulable {
 - Logge les erreurs importantes.
 - Ne suppose pas que l’exécution est immédiate.
 - Ne transmets pas de gros objets en paramètre, transmets plutôt des IDs.
+
+Ces précautions correspondent chacune à un incident déjà vu en production : un Queueable qui s’enqueue lui-même sans condition d’arrêt peut tourner indéfiniment jusqu’à ce que la limite du nombre de jobs asynchrones enchaînables dans un même contexte soit atteinte, bloquant tout traitement asynchrone ultérieur ; du code qui suppose que le traitement asynchrone est terminé juste après l’appel va lire des données pas encore mises à jour et produire des résultats incohérents ou incomplets ; et transmettre une liste complète de `SObject` en paramètre d’un Queueable au lieu d’un `Set<Id>` fait grossir le volume de données sérialisées avec le job, ce qui peut dépasser la limite de taille autorisée et faire échouer le job avant même qu’il commence à s’exécuter.
 
 ---
 
@@ -1138,6 +1282,19 @@ Les tests Apex ne sont pas seulement une obligation de couverture. Ils doivent p
 - Utiliser `Test.startTest()` et `Test.stopTest()`.
 - Utiliser des assertions.
 - Tester l’asynchrone avec `Test.stopTest()`.
+
+Un test qui n’insère qu’un seul enregistrement peut très bien passer avec un code qui contient un SOQL ou un DML dans une boucle : une boucle d’un seul élément ne dépasse jamais aucune limite gouverneur. Ce même code plantera pourtant dès qu’il traitera 200 enregistrements en production. Tester le bulk n’est donc pas une formalité de couverture de code : c’est, avant la mise en production, le seul moyen fiable de détecter ce genre de bug qu’un test à un seul enregistrement ne peut pas révéler.
+
+## `System.assertEquals` vs classe `Assert`
+
+Les exemples de ce guide utilisent `System.assertEquals`, `System.assert` et `System.assertNotEquals`, largement répandus dans le code existant. Salesforce recommande désormais la classe `Assert` (`Assert.areEqual`, `Assert.isTrue`, `Assert.isFalse`, `Assert.fail`, etc.) pour les nouveaux tests, car elle produit des messages d’échec plus riches et plus faciles à diagnostiquer.
+
+```apex
+Assert.areEqual('Acme', accounts[0].Name, 'Le nom du compte devrait être normalisé.');
+Assert.isTrue(results.size() > 0, 'Au moins un résultat était attendu.');
+```
+
+Il n’est pas nécessaire de réécrire les tests existants qui utilisent `System.assertEquals`, mais privilégie `Assert` pour tout nouveau test.
 
 ## Exemple simple
 
@@ -1284,6 +1441,8 @@ System.debug(LoggingLevel.ERROR, 'Erreur: ' + e.getMessage());
 - Debug permanent dans du code critique.
 - Messages vagues comme `System.debug('ici')`.
 
+Chacun de ces points a un coût concret. Le fichier de log Apex a une taille maximale : des logs trop volumineux (boucles qui débuggent chaque itération, objets entiers sérialisés) font tronquer le log avant même d’atteindre la ligne qui t’intéresse, te privant de l’information au moment où tu en as le plus besoin. Débugger des données sensibles (mots de passe, jetons, informations personnelles) les expose à quiconque a accès aux logs de l’org, ce qui est un problème de sécurité, pas seulement de propreté. Et un message vague comme `'ici'` ne te dira pas, six mois plus tard, lequel des dix appels à cette méthode a produit l’erreur que tu essaies de comprendre.
+
 ## Diagnostic de limites
 
 ```apex
@@ -1343,6 +1502,8 @@ Bon :
 for (Account acc : accounts) {
 }
 ```
+
+Un commentaire qui répète ce que fait le code (“on boucle sur les comptes”) n’apporte aucune information : le code le dit déjà, et il rajoute une ligne à maintenir en plus. Un commentaire qui explique une décision métier ou technique non évidente évite qu’un futur développeur — ou toi-même dans six mois — supprime cette condition en pensant qu’elle est superflue, ou perde du temps à deviner pourquoi elle existe avant d’oser la modifier.
 
 ---
 
@@ -1565,13 +1726,15 @@ trigger AccountTrigger on Account (after update) {
 }
 ```
 
+Un trigger de plusieurs centaines de lignes est quasiment impossible à tester unitairement de façon isolée (il faut passer par un vrai insert/update pour l’exécuter), impossible à réutiliser depuis un batch ou un contrôleur LWC, et risqué à modifier : personne ne peut être certain, sans tout relire, de ce qui dépend de la portion de code qu’il s’apprête à changer. Ce genre de trigger finit presque toujours par accumuler des conditions imbriquées et des drapeaux statiques pour éviter les boucles de récursion, ce qui rend chaque nouvelle modification plus lente et plus risquée que la précédente.
+
 ## Hardcoded IDs
 
 ```apex
 Id profileId = '00eXXXXXXXXXXXX';
 ```
 
-Préférer requêter par DeveloperName ou utiliser Custom Metadata selon le cas.
+Préférer requêter par DeveloperName ou utiliser Custom Metadata selon le cas. Un Id Salesforce n’est pas garanti d’être identique d’un environnement à l’autre : un profil, un record type ou un utilisateur n’a pas le même Id en sandbox, en production et dans un org fraîchement créé. Un Id codé en dur qui fonctionne très bien dans le sandbox où le code a été écrit pointera, une fois déployé en production, vers un enregistrement inexistant ou vers un enregistrement complètement différent — provoquant une exception (`QueryException`, `NullPointerException`) ou pire, un comportement silencieusement incorrect qui ne sera découvert qu’après la mise en production.
 
 ## Tests sans assertions
 
@@ -1590,7 +1753,7 @@ Un test sans assertion prouve très peu de choses.
 Account acc = [SELECT Id FROM Account LIMIT 1];
 ```
 
-À éviter dans les tests. Crée tes propres données.
+À éviter dans les tests. Crée tes propres données. Cette requête suppose qu’un compte existe déjà dans l’org — ce qui est vrai dans un sandbox de développement rempli de données, mais faux dans un scratch org fraîchement créé ou dans l’org de recette utilisée par un pipeline CI/CD avant un déploiement. Le test échoue alors avec une erreur `List has no rows for assignment`, typiquement au pire moment : juste avant une mise en production, sans lien apparent avec le code que tu viens réellement de modifier.
 
 ---
 
@@ -1651,3 +1814,17 @@ Avant de livrer du code Apex, pose toujours ces questions :
 6. Est-ce compréhensible par un autre développeur ?
 
 Si la réponse est oui, tu es sur la bonne voie.
+
+---
+
+# Pour aller plus loin
+
+Ce guide couvre les bases pour un débutant. Le reste de ce dépôt contient une base de connaissances technique plus détaillée et plus exhaustive, organisée par dossier :
+
+- `patterns/` : patterns Apex documentés en détail (trigger handler, selector, service, etc.).
+- `principes/` : principes fondamentaux et règles techniques approfondies.
+- `checklists/` : checklists techniques prêtes à l’emploi.
+- `prompts/` : prompts IA plus poussés que ceux de la section 25.
+- `templates/` : templates de code Apex prêts à copier.
+
+Ces fichiers sont plus techniques et moins pédagogiques que ce guide. Ils sont particulièrement utiles pour approfondir un sujet précis une fois les bases acquises, ou pour être fournis en contexte à une IA générative de code afin d’obtenir des réponses plus précises sur un point technique donné.

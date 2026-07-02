@@ -28,7 +28,7 @@ Avant de générer du code, l’IA doit répondre mentalement aux questions suiv
 - Le code est-il récursif ou peut-il être rappelé dans la même transaction ?
 - Les limites gouverneur sont-elles protégées ?
 - Le traitement doit-il rester synchrone ou être déporté en asynchrone ?
-- Les accès aux données respectent-ils le modèle de sécurité attendu ?
+- Les accès aux données respectent-ils le modèle de sécurité attendu (sharing explicite `with sharing`/`without sharing`/`inherited sharing`, enforcement CRUD/FLS via `WITH USER_MODE` ou `Security.stripInaccessible`, absence d’injection SOQL) ? Voir [`patterns/15_SECURITE_CRUD_FLS_SHARING.md`](patterns/15_SECURITE_CRUD_FLS_SHARING.md).
 - Les tests couvrent-ils succès, erreurs, bulk et absence de données ?
 
 ## Format de réponse recommandé

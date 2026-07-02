@@ -4,7 +4,7 @@
 
 Apex ressemble syntaxiquement à Java ou C#, mais son comportement réel dépend fortement de la plateforme Salesforce. L’IA doit donc raisonner en termes de transaction Salesforce, contexte d’exécution, limites gouverneur, ordre d’exécution et automatisations déclaratives.
 
-## Les quatre concepts à vérifier systématiquement
+## Les cinq concepts à vérifier systématiquement
 
 ### 1. Contexte d’exécution
 
@@ -21,6 +21,10 @@ Les limites ne sont pas un détail technique. Elles structurent l’architecture
 ### 4. Bulk patterns
 
 Tout code doit être conçu pour fonctionner sur plusieurs enregistrements. Une méthode qui accepte un seul `Id` est souvent moins robuste qu’une méthode qui accepte un `Set<Id>`.
+
+### 5. Sécurité (CRUD/FLS/Sharing)
+
+Le contexte d’exécution Apex ignore par défaut le sharing et les permissions de l’utilisateur. L’IA doit systématiquement expliciter le mode de sharing (`with sharing`, `without sharing`, `inherited sharing`) et faire respecter les droits CRUD/FLS sur les données manipulées. Voir [`patterns/15_SECURITE_CRUD_FLS_SHARING.md`](patterns/15_SECURITE_CRUD_FLS_SHARING.md).
 
 ## Règle de conception
 
